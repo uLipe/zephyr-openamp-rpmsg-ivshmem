@@ -22,10 +22,16 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include "rpmsg_ivshmem_backend.h"
 
 #define VDEV_STATUS_SIZE	0x400
-#define VRING_COUNT		2
-#define VRING_ALIGNMENT	4
-#define VRING_SIZE		16
+#define VRING_COUNT			2
+#define VRING_ALIGNMENT		4
+#define VRING_SIZE			16
 #define IVSHMEM_EV_LOOP_STACK_SIZE 8192
+
+#if CONFIG_OPENAMP_MASTER
+#define VIRTQUEUE_ID 0
+#else
+#define VIRTQUEUE_ID 1
+#endif
 
 K_THREAD_STACK_DEFINE(ivshmem_ev_loop_stack, IVSHMEM_EV_LOOP_STACK_SIZE);
 static struct k_thread ivshmem_ev_loop_thread;
@@ -43,8 +49,8 @@ static struct metal_device shm_device = {
 			.virt       = (void *) 0,
 			.physmap    = shm_physmap,
 			.size       = 0,
-			.page_shift = 0xffffffff,
-			.page_mask  = 0xffffffff,
+			.page_shift = (metal_phys_addr_t)(-1),
+			.page_mask  = (metal_phys_addr_t)(-1),
 			.mem_flags  = 0,
 			.ops        = { NULL },
 		},
@@ -69,26 +75,30 @@ static struct metal_io_region *io;
 static struct virtqueue *vq[2];
 
 #ifdef CONFIG_OPENAMP_MASTER
+K_SEM_DEFINE(ept_sem, 0, 1);
 static struct rpmsg_virtio_shm_pool shpool;
+struct rpmsg_device* rpmsg_ivshmem_rdev;
 #endif
 
-static uintptr_t shmem;
+static uintptr_t shmem_base;
+static uintptr_t vdev_status_base;
+static uintptr_t rx_vring_base;
+static uintptr_t tx_vring_base;
 static size_t shmem_size;
-struct rpmsg_endpoint rpmsg_ept;
-static rpmsg_ivshmem_ept_cb_t ep_cb;
+static int remote_endpoint_dst_addr = -1;
 
 static unsigned char virtio_get_status(struct virtio_device *vdev)
 {
 #ifdef CONFIG_OPENAMP_MASTER
 	return VIRTIO_CONFIG_STATUS_DRIVER_OK;
 #else
-	return sys_read8(shmem);
+	return sys_read8(vdev_status_base);
 #endif
 }
 
 static void virtio_set_status(struct virtio_device *vdev, unsigned char status)
 {
-	sys_write8(status, shmem);
+	sys_write8(status, vdev_status_base);
 }
 
 static uint32_t virtio_get_features(struct virtio_device *vdev)
@@ -103,11 +113,14 @@ static void virtio_set_features(struct virtio_device *vdev,
 
 static void virtio_notify(struct virtqueue *vq)
 {
+	uint16_t peer_dest_id = ivshmem_get_id(ivshmem_dev)
 #ifdef CONFIG_OPENAMP_MASTER
-	ivshmem_int_peer(ivshmem_dev, (uint16_t)ivshmem_get_id(ivshmem_dev) + 1, 0);
+	+1;
 #else
-	ivshmem_int_peer(ivshmem_dev, (uint16_t)ivshmem_get_id(ivshmem_dev) -1, 0);
+	-1;
 #endif
+	LOG_DBG("sending notification to the peer id 0x%x \n", peer_dest_id);
+	ivshmem_int_peer(ivshmem_dev, peer_dest_id, 0);
 }
 
 struct virtio_dispatch dispatch = {
@@ -118,36 +131,18 @@ struct virtio_dispatch dispatch = {
 	.notify = virtio_notify,
 };
 
-int endpoint_cb(struct rpmsg_endpoint *ept, void *data,
-		size_t len, uint32_t src, void *priv)
-{
-	if(ep_cb) {
-		return ep_cb(ept, data, len);
-	}
-
-	return RPMSG_SUCCESS;
-}
-
-static void rpmsg_service_unbind(struct rpmsg_endpoint *ept)
-{
-}
-
 #ifdef CONFIG_OPENAMP_MASTER
-
-K_SEM_DEFINE(ept_sem, 0, 1);
 
 void ns_bind_cb(struct rpmsg_device *rdev, const char *name, uint32_t dest)
 {
-	rpmsg_create_ept(&rpmsg_ept, rdev, name,
-		RPMSG_ADDR_ANY, dest,
-		endpoint_cb,
-		rpmsg_service_unbind);
-
+	rpmsg_ivshmem_rdev = rdev;
+	remote_endpoint_dst_addr = dest;
 	k_sem_give(&ept_sem);
 }
 
 #endif
 
+/* IVSHMEM receives DOORBELL notifications in form of a event loop based in k_poll*/
 static void ivshmem_event_loop_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -173,12 +168,12 @@ static void ivshmem_event_loop_thread(void *p1, void *p2, void *p3)
 	ret = ivshmem_register_handler(ivshmem_dev, &sig, 0);
 
 	if (ret < 0) {
-		printk("registering handlers must be supported: %d \n", ret);
+		LOG_ERR("registering handlers must be supported: %d \n", ret);
 		k_panic();
 	}
 
 	while (1) {
-		printk("%s: waiting interrupt from client... \n", __func__);
+		LOG_DBG("%s: waiting interrupt from client... \n", __func__);
 		ret = k_poll(events, ARRAY_SIZE(events), K_FOREVER);
 
 		k_poll_signal_check(&sig, &poll_signaled, &ivshmem_vector_rx);
@@ -186,7 +181,7 @@ static void ivshmem_event_loop_thread(void *p1, void *p2, void *p3)
 		k_poll_signal_reset(&sig);
 
 		/* notify receive Vqueue once cross interrupt is received */
-		virtqueue_notification(vq[0]);
+		virtqueue_notification(vq[VIRTQUEUE_ID]);
 	}
 }
 
@@ -197,16 +192,25 @@ int init_ivshmem_backend(void)
 	struct metal_init_params metal_params = METAL_INIT_DEFAULTS;
 
 	if (!IS_ENABLED(CONFIG_IVSHMEM_DOORBELL)) {
-		printf("CONFIG_IVSHMEM_DOORBELL is not enabled \n");
+		LOG_ERR("CONFIG_IVSHMEM_DOORBELL is not enabled \n");
 		k_panic();
 	}
 
-	shmem_size = ivshmem_get_mem(ivshmem_dev, &shmem) - VDEV_STATUS_SIZE;
-	shm_device.regions[0].virt = (void *)(shmem + VDEV_STATUS_SIZE);
-	shm_device.regions[0].size = shmem_size;
-	shm_physmap[0] = (metal_phys_addr_t)shmem;
+	shmem_size = ivshmem_get_mem(ivshmem_dev, &shmem_base);
+	shmem_size -= VDEV_STATUS_SIZE;
+	vdev_status_base = shmem_base;
+	shmem_base += VDEV_STATUS_SIZE;
 
-	printk("Memory got from ivshmem: %p, size: %d \n", shmem, shmem_size);
+	LOG_DBG("Memory got from ivshmem: %p, size: %ld \n", (void *)shmem_base, shmem_size);
+
+	shm_device.regions[0].virt = (void *)(shmem_base);
+	shm_device.regions[0].size = shmem_size;
+	shm_physmap[0] = (metal_phys_addr_t)(shmem_base);
+
+
+#ifdef CONFIG_OPENAMP_MASTER
+	virtio_set_status(NULL, 0);
+#endif
 
 	k_thread_create(&ivshmem_ev_loop_thread,
 		ivshmem_ev_loop_stack,
@@ -216,82 +220,76 @@ int init_ivshmem_backend(void)
 
 	status = metal_init(&metal_params);
 	if (status != 0) {
-		printk("metal_init: failed - error code %d\n", status);
+		LOG_ERR("metal_init: failed - error code %d\n", status);
 		return status;
 	}
 
 	status = metal_register_generic_device(&shm_device);
 	if (status != 0) {
-		printk("Couldn't register shared memory device: %d\n", status);
+		LOG_ERR("Couldn't register shared memory device: %d\n", status);
 		return status;
 	}
 
 	status = metal_device_open("generic", "ivshmem0", &device);
 	if (status != 0) {
-		printk("metal_device_open failed: %d\n", status);
+		LOG_ERR("metal_device_open failed: %d\n", status);
 		return status;
 	}
 
 	io = metal_device_io_region(device, 0);
 	if (io == NULL) {
-		printk("metal_device_io_region failed to get region\n");
+		LOG_ERR("metal_device_io_region failed to get region\n");
 		return status;
 	}
 
 	vq[0] = virtqueue_allocate(VRING_SIZE);
 	if (vq[0] == NULL) {
-		printk("virtqueue_allocate failed to alloc vq[0]\n");
+		LOG_ERR("virtqueue_allocate failed to alloc vq[0]\n");
 		return status;
 	}
 	vq[1] = virtqueue_allocate(VRING_SIZE);
 	if (vq[1] == NULL) {
-		printk("virtqueue_allocate failed to alloc vq[1]\n");
+		LOG_ERR("virtqueue_allocate failed to alloc vq[1]\n");
 		return status;
 	}
 
-	vdev.vrings_num = VRING_COUNT;
-	vdev.func = &dispatch;
+	rx_vring_base = vdev_status_base + shmem_size - VDEV_STATUS_SIZE;
+	tx_vring_base = vdev_status_base + shmem_size;
+
+	LOG_ERR("rx_vring_address: %p - tx_vring_address: %p \n", (void *)rx_vring_base, (void *)tx_vring_base);
+
 	rvrings[0].io = io;
-	rvrings[0].info.vaddr = (void *)(shmem + shmem_size - VDEV_STATUS_SIZE);
+	rvrings[0].info.vaddr = (void *)(rx_vring_base);
 	rvrings[0].info.num_descs = VRING_SIZE;
 	rvrings[0].info.align = VRING_ALIGNMENT;
 	rvrings[0].vq = vq[0];
 
 	rvrings[1].io = io;
-	rvrings[1].info.vaddr = (void *)(shmem + shmem_size);
+	rvrings[1].info.vaddr = (void *)(tx_vring_base);
 	rvrings[1].info.num_descs = VRING_SIZE;
 	rvrings[1].info.align = VRING_ALIGNMENT;
 	rvrings[1].vq = vq[1];
 
+	vdev.vrings_num = VRING_COUNT;
+	vdev.func = &dispatch;
 	vdev.vrings_info = &rvrings[0];
 
 #ifdef CONFIG_OPENAMP_MASTER
 	vdev.role = RPMSG_HOST;
 
-	rpmsg_virtio_init_shm_pool(&shpool, (void *)(shmem + VDEV_STATUS_SIZE), shmem_size);
+	rpmsg_virtio_init_shm_pool(&shpool, (void *)(shmem_base), shmem_size);
 	status = rpmsg_init_vdev(&rvdev, &vdev, ns_bind_cb, io, &shpool);
 	if (status != 0) {
-		printk("rpmsg_init_vdev failed %d\n", status);
+		LOG_ERR("rpmsg_init_vdev failed %d\n", status);
 		return status;
 	}
-
 	k_sem_take(&ept_sem, K_FOREVER);
 
 #else
-
 	vdev.role = RPMSG_REMOTE;
 	status = rpmsg_init_vdev(&rvdev, &vdev, NULL, io, NULL);
 	if (status != 0) {
-		printk("rpmsg_init_vdev failed %d\n", status);
-		return status;
-	}
-
-	struct rpmsg_device *rdev = rpmsg_virtio_get_rpmsg_device(&rvdev);
-
-	status = rpmsg_create_ept(&rpmsg_ept, rdev, "k", RPMSG_ADDR_ANY,
-			RPMSG_ADDR_ANY, endpoint_cb, rpmsg_service_unbind);
-	if (status != 0) {
-		printk("rpmsg_create_ept failed %d\n", status);
+		LOG_ERR("rpmsg_init_vdev failed %d\n", status);
 		return status;
 	}
 #endif
@@ -301,9 +299,16 @@ int init_ivshmem_backend(void)
 
 SYS_INIT(init_ivshmem_backend, POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY);
 
-
-int rpmsg_ivshmem_register_ep_callback(rpmsg_ivshmem_ept_cb_t callback)
+struct rpmsg_device* get_rpmsg_ivshmem_device(void)
 {
-	ep_cb = callback;
-	return 0;
+#ifdef CONFIG_OPENAMP_MASTER
+	return rpmsg_ivshmem_rdev;
+#else
+	return rpmsg_virtio_get_rpmsg_device(&rvdev);
+#endif
+}
+
+int get_rpmsg_ivshmem_ept_dest_addr(void)
+{
+	return remote_endpoint_dst_addr;
 }
